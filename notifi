@@ -1,0 +1,82 @@
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, collect_list, struct, from_json
+from pyspark.sql.types import StringType, ArrayType, StructType, StructField
+import smtplib
+from io import StringIO
+import json
+import pandas as pd
+
+# Sample PySpark setup
+spark = SparkSession.builder.appName("NotificationSystem").getOrCreate()
+
+# Notification Classes
+class Notification:
+    def send(self, details, failed_rules, results_df):
+        raise NotImplementedError
+
+class EmailNotification(Notification):
+    def send(self, details, failed_rules, results_df):
+        recipients = details['recipients']
+
+        # Convert results_df to CSV
+        csv_data = StringIO()
+        results_df.toPandas().to_csv(csv_data, index=False)
+        csv_content = csv_data.getvalue()
+
+        # Mocked email sending - In a real-world scenario, you'd connect and send
+        print(f"Sending email to {recipients} with failed rules {failed_rules} and content:\n{csv_content}")
+
+class SlackNotification(Notification):
+    def send(self, details, failed_rules, results_df):
+        channel = details['channel']
+
+        # Mocked Slack message send - Integrate with a real Slack client in a real-world scenario
+        print(f"Sending message to Slack channel {channel} about failed rules: {failed_rules}")
+
+# Factory to produce notification instances based on type
+class NotificationFactory:
+    @staticmethod
+    def get_notification(notification_type):
+        if notification_type == "email":
+            return EmailNotification()
+        elif notification_type == "slack":
+            return SlackNotification()
+        else:
+            raise ValueError(f"Unsupported notification type: {notification_type}")
+
+# Sample data
+results_df = spark.createDataFrame([(1, 'Rule_1'), (2, 'Rule_2'), (3, 'Rule_1'), (4, 'Rule_3')], ['id', 'rule_id'])
+
+rule_to_notification_group_mapping_df = spark.createDataFrame([('Rule_1', 'Group_A'), ('Rule_2', 'Group_A'), ('Rule_3', 'Group_B')], ['rule_id', 'group_id'])
+
+notification_group_details_schema = StructType([
+    StructField("group_id", StringType()),
+    StructField("notification_type", StringType()),
+    StructField("notification_details", StringType())
+])
+
+notification_group_details_df = spark.createDataFrame([
+    ('Group_A', 'email', '{"recipients": ["userA@example.com", "userB@example.com"]}'),
+    ('Group_B', 'slack', '{"channel": "#general"}'),
+], schema=notification_group_details_schema)
+
+details_schema = StructType([
+    StructField("recipients", ArrayType(StringType())),  # For email
+    StructField("channel", StringType())  # For slack
+])
+notification_group_details_df = notification_group_details_df.withColumn("details", from_json(col("notification_details"), details_schema))
+
+notification_df = (results_df
+                   .join(rule_to_notification_group_mapping_df, on="rule_id")
+                   .join(notification_group_details_df, on="group_id"))
+
+grouped_notifications_df = (notification_df
+                            .groupBy("notification_type", "details")
+                            .agg(collect_list("rule_id").alias("failed_rules"), collect_list(struct("id", "rule_id")).alias("results")))
+
+# Send notifications
+for row in grouped_notifications_df.rdd.collect():
+    notification = NotificationFactory.get_notification(row['notification_type'])
+    details = row['details'].asDict()
+    results_sub_df = spark.createDataFrame(row['results'], ["id", "rule_id"])
+    notification.send(details, row['failed_rules'], results_sub_df)
